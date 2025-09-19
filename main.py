@@ -17,7 +17,7 @@ load_dotenv(dotenv_path=".env")
 
 api_key = os.getenv("XAI_API_KEY")
 
-date = datetime(2025, 9, 19, tzinfo=timezone.utc)
+date = datetime(2024, 4, 30, tzinfo=timezone.utc)
 ticker = "TSLA"
 
 system_prompt = """
@@ -90,11 +90,10 @@ async def live_search_batch_dates(api_key, ticker: str, dates: list[datetime]):
     date_range_str = f"from {date_list[0]} to {date_list[-1]}"
 
     batch_prompt = f"""
-    Analyze sentiment for {ticker} across multiple dates: {', '.join(date_list)}.
+    Analyze sentiment for {ticker} for these SPECIFIC dates: {', '.join(date_list)}.
+    For each date listed above, search relevant news, web, and social platforms for major developments affecting the stock within 24 to 48 hours prior to that date.
 
-    For each date, search relevant news, web, and social platforms for major developments affecting the stock.
-
-    Return a valid JSON array with one object for each date, in this exact format:
+    Return a valid JSON array with one object for each date, ensuring EQUAL ATTENTION to all dates. Do not skip or provide minimal analysis for any date:
     [
       {{
         "date": "YYYY-MM-DD",
@@ -110,23 +109,25 @@ async def live_search_batch_dates(api_key, ticker: str, dates: list[datetime]):
       }}
     ]
 
-    IMPORTANT:
+    CRITICAL REQUIREMENTS:
     - Return valid JSON only, no comments or extra text
-    - Include an entry for each date even if no significant events found
-    - Use neutral sentiment (score: 0.0) for dates with no major developments
+    - Include an entry for each date: {', '.join(date_list)}
+    - Give EQUAL analysis depth to ALL dates
+    - If no events found for a date, still provide thorough analysis of market context
+    - Do not default to neutral for recent dates without proper analysis
     """
 
-    # Use the earliest and latest dates for search window
-    earliest_date = min(dates)
+    # Use a wider search window to ensure data availability
+    earliest_date = min(dates) - timedelta(days=1)  # Start 1 day earlier
     latest_date = max(dates)
 
     chat = client.chat.create(
         model="grok-3-mini",
         search_parameters=SearchParameters(
-            mode="on",  # Force search instead of auto
-            from_date=earliest_date,  # Wider window
+            mode="on",
+            from_date=earliest_date,
             to_date=latest_date,
-            sources=[x_source()],
+            sources=[news_source(), x_source()],
         ),
     )
 
@@ -147,10 +148,10 @@ async def live_search_with_web_and_news(api_key, ticker: str, date: datetime):
         date=date.strftime("%Y-%m-%d"),
     )
     chat = client.chat.create(
-        model="grok-3-mini-fast",
+        model="grok-3-mini",
         search_parameters=SearchParameters(
-            mode="auto",
-            from_date=date - timedelta(days=2),
+            mode="on",
+            from_date=date,
             to_date=date,
             # sources=[web_source(), news_source(), x_source()],
             sources=[x_source()],
@@ -169,13 +170,13 @@ async def live_search_with_web_and_news(api_key, ticker: str, date: datetime):
     print(f"Citations: {response.citations}")
     print(f"Unique search sources: {response.usage.num_sources_used}")
 
-import pandas as pd
-
 def calc_sentiment_entries_exits(
     df: pd.DataFrame,
-    entry_threshold: float = 0.6,
-    exit_threshold: float = -0.6,
-    sentiment_col: str = "sentiment_score"
+    entry_threshold: float = 0.7,
+    exit_threshold: float = -0.7,
+    sentiment_col: str = "sentiment_score",
+    confidence_col: str = "confidence",
+    confidence_min: float = 0.7
 ) -> pd.DataFrame:
     """
     Adds entry and exit signal columns to the DataFrame based on sentiment thresholds.
@@ -191,8 +192,8 @@ def calc_sentiment_entries_exits(
     """
     # Signal: True where sentiment crosses above entry_threshold (and wasn't already True)
     df = df.copy()
-    entry = df[sentiment_col] > entry_threshold
-    exit = df[sentiment_col] < exit_threshold
+    entry = (df[sentiment_col] >= entry_threshold) & (df[confidence_col] >= confidence_min)
+    exit = (df[sentiment_col] <= exit_threshold) & (df[confidence_col] >= confidence_min)
 
     # Only trigger a new entry when not previously in entry (avoids stacked entries in uptrend)
     df["entry_signal"] = entry & (~entry.shift(1, fill_value=False))
@@ -244,7 +245,7 @@ def fetch_historical_data(ticker: str, end_date: datetime, min_days: int = 0) ->
     #     min_days = 30
 
     # Calculate start date (add a few extra days to ensure we get enough trading days)
-    start_date = end_date - timedelta(days=min_days + 1)
+    start_date = end_date - timedelta(days=min_days + 15)
 
     # Download historical data
     stock = yf.Ticker(ticker)
@@ -320,7 +321,7 @@ if __name__ == "__main__":
     # Extract dates from price_df and get AI analysis using BATCH processing
     all_sentiment_data = []
 
-    def chunk_dates(dates, chunk_size=3):
+    def chunk_dates(dates, chunk_size):
         """Split dates into chunks for batch processing"""
         for i in range(0, len(dates), chunk_size):
             yield dates[i:i + chunk_size]
@@ -350,18 +351,18 @@ if __name__ == "__main__":
                 print(f"Error in batch {i+1}: {e}")
                 # Fallback to individual analysis for this batch
                 print(f"Falling back to individual analysis for batch {i+1}")
-                for date in chunk:
-                    try:
-                        df_single = await live_search_with_web_and_news(api_key, ticker, date)
-                        if not df_single.empty:
-                            sentiment_single = calc_sentiment_entries_exits(df_single)
-                            results.append(sentiment_single)
-                    except Exception as individual_error:
-                        print(f"Individual analysis failed for {date.strftime('%Y-%m-%d')}: {individual_error}")
+                # for date in chunk:
+                #     try:
+                #         df_single = await live_search_with_web_and_news(api_key, ticker, date)
+                #         if not df_single.empty:
+                #             sentiment_single = calc_sentiment_entries_exits(df_single)
+                #             results.append(sentiment_single)
+                #     except Exception as individual_error:
+                #         print(f"Individual analysis failed for {date.strftime('%Y-%m-%d')}: {individual_error}")
 
         return results
 
-    # Run batch analysis (3 dates per batch = ~66% cost reduction)
+    # Run batch analysis (2 dates per batch = ~50% cost reduction)
     print(f"Starting BATCH analysis for {len(price_df)} dates (3 dates per batch)...")
     all_sentiment_data = asyncio.run(analyze_batch_dates(ticker, price_df['Date'], batch_size=3))
 
